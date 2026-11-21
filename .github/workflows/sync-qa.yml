@@ -46,13 +46,13 @@ jobs:
             --target-org my-org \
             --result-format csv > /tmp/breaks_data.csv
 
-          # 4A. Fetch Team Agents strictly under your 6 Managers (excluding the 4 agents)
+          # 4A. Fetch Team Agents under the 6 Managers (excluding the 4 agents)
           sf data query \
             --query "SELECT Id, Name FROM User WHERE Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit')" \
             --target-org my-org \
             --result-format csv > /tmp/team_users.csv
 
-          # 4B & 4C. Filter CaseHistory strictly by your Team User IDs, reconstruct SLA lifecycle rows, and push all 4 sheets
+          # 4B & 4C. Reconstruct exact Salesforce Case Lifecycle SLA rows & push all 4 CSVs to Google Sheets
           python3 -c '
           import csv, io, json, os, subprocess, urllib.request
           from datetime import datetime
@@ -69,31 +69,72 @@ jobs:
 
           id_list = ",".join(f"\x27{uid}\x27" for uid in team_ids)
 
-          sla_soql = (
-              "SELECT CaseId, Case.Owner.Name, Case.Subject, Field, OldValue, NewValue, CreatedDate "
+          # Step 1: Get CaseIds where Owner history changed this month on Resolved/Canceled cases
+          owner_hist_soql = (
+              "SELECT CaseId, NewValue, OldValue "
               "FROM CaseHistory "
-              "WHERE Field IN (\x27Status\x27, \x27Owner\x27) "
+              "WHERE Field = \x27Owner\x27 "
               "AND Case.CreatedDate = THIS_MONTH "
               "AND Case.Status IN (\x27Canceled\x27, \x27Resolved\x27) "
-              "AND Case.ATG_Current_Queue_Name__c NOT IN (\x27FFT B2B - Reconciliation\x27, \x27FFT ALM - Manual Validation\x27) "
-              f"AND Case.OwnerId IN ({id_list}) "
-              "ORDER BY CaseId ASC, CreatedDate ASC"
+              "AND Case.ATG_Current_Queue_Name__c NOT IN (\x27FFT B2B - Reconciliation\x27, \x27FFT ALM - Manual Validation\x27)"
           )
-
           subprocess.run(
-              ["sf", "data", "query", "--query", sla_soql, "--target-org", "my-org", "--result-format", "csv"],
-              stdout=open("/tmp/sla_raw_history.csv", "w", encoding="utf-8"),
+              ["sf", "data", "query", "--query", owner_hist_soql, "--target-org", "my-org", "--result-format", "csv"],
+              stdout=open("/tmp/owner_hist.csv", "w", encoding="utf-8"),
               check=True
           )
 
+          team_case_ids = set()
+          with open("/tmp/owner_hist.csv", "r", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  if (r.get("NewValue") or "").strip() in team_names or (r.get("OldValue") or "").strip() in team_names:
+                      team_case_ids.add(r["CaseId"])
+
+          # Also include cases owned directly by team_ids with zero owner transfers
+          direct_cases_soql = (
+              "SELECT Id FROM Case "
+              "WHERE CreatedDate = THIS_MONTH "
+              "AND Status IN (\x27Canceled\x27, \x27Resolved\x27) "
+              "AND ATG_Current_Queue_Name__c NOT IN (\x27FFT B2B - Reconciliation\x27, \x27FFT ALM - Manual Validation\x27) "
+              f"AND OwnerId IN ({id_list})"
+          )
+          subprocess.run(
+              ["sf", "data", "query", "--query", direct_cases_soql, "--target-org", "my-org", "--result-format", "csv"],
+              stdout=open("/tmp/direct_cases.csv", "w", encoding="utf-8"),
+              check=True
+          )
+          with open("/tmp/direct_cases.csv", "r", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  if r.get("Id"):
+                      team_case_ids.add(r["Id"].strip())
+
+          # Step 2: Query full Status + Owner CaseHistory ONLY for those exact team CaseIds (in chunks of 500 IDs)
+          all_case_ids = sorted(team_case_ids)
           cases = defaultdict(list)
           case_meta = {}
-          with open("/tmp/sla_raw_history.csv", "r", encoding="utf-8") as f:
-              for r in csv.DictReader(f):
+
+          for i in range(0, len(all_case_ids), 500):
+              chunk = ",".join(f"\x27{cid}\x27" for cid in all_case_ids[i:i+500])
+              chunk_soql = (
+                  "SELECT CaseId, Case.CreatedDate, Case.Owner.Name, Case.Subject, Field, OldValue, NewValue, CreatedDate "
+                  "FROM CaseHistory "
+                  "WHERE Field IN (\x27Status\x27, \x27Owner\x27) "
+                  f"AND CaseId IN ({chunk}) "
+                  "ORDER BY CaseId ASC, CreatedDate ASC"
+              )
+              res = subprocess.run(
+                  ["sf", "data", "query", "--query", chunk_soql, "--target-org", "my-org", "--result-format", "csv"],
+                  capture_output=True, text=True, check=True
+              )
+              for r in csv.DictReader(io.StringIO(res.stdout)):
                   cid = r["CaseId"]
                   cases[cid].append(r)
                   if cid not in case_meta:
-                      case_meta[cid] = (r.get("Case.Owner.Name", ""), r.get("Case.Subject", ""))
+                      case_meta[cid] = (
+                          r.get("Case.Owner.Name", ""),
+                          r.get("Case.Subject", ""),
+                          r.get("Case.CreatedDate", "")
+                      )
 
           def parse_ts(ts_str):
               return datetime.strptime(ts_str.replace("+0000", "+00:00"), "%Y-%m-%dT%H:%M:%S.%f%z")
@@ -103,7 +144,9 @@ jobs:
           writer.writerow(["Case History Owner", "Case Owner", "Subject", "Duration"])
 
           for cid, events in cases.items():
-              final_owner, subject = case_meta[cid]
+              final_owner, subject, case_created_str = case_meta[cid]
+              case_created_ts = parse_ts(case_created_str)
+
               clean_events = []
               for ev in events:
                   if ev["Field"] == "Owner":
@@ -112,14 +155,24 @@ jobs:
                           continue
                   clean_events.append(ev)
 
+              # Sort by timestamp, and at identical timestamps process Owner updates before Status changes
+              clean_events.sort(key=lambda e: (e["CreatedDate"], 0 if e["Field"] == "Owner" else 1))
+
+              # Determine initial owner & initial status at Case creation
               current_owner = final_owner
               for ev in clean_events:
                   if ev["Field"] == "Owner" and ev["OldValue"]:
                       current_owner = ev["OldValue"]
                       break
 
-              current_status = "New"
-              in_progress_start = None
+              initial_status = "New"
+              for ev in clean_events:
+                  if ev["Field"] == "Status" and ev["OldValue"]:
+                      initial_status = ev["OldValue"]
+                      break
+
+              current_status = initial_status
+              in_progress_start = case_created_ts if initial_status == "In Progress" else None
               seg_owner = current_owner
 
               for ev in clean_events:
@@ -172,4 +225,4 @@ jobs:
           post_csv(sla_csv_text, os.environ["WEBHOOK_SLA"], "SLA")
           '
 
-          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/sla_raw_history.csv
+          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/owner_hist.csv /tmp/direct_cases.csv
