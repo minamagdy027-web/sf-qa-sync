@@ -46,13 +46,13 @@ jobs:
             --target-org my-org \
             --result-format csv > /tmp/breaks_data.csv
 
-          # 4A. Fetch Team Agents under the 6 Managers (excluding the 4 agents)
+          # 4A. Fetch Team Agents strictly under your 6 Managers (excluding the 4 agents)
           sf data query \
             --query "SELECT Id, Name FROM User WHERE Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit')" \
             --target-org my-org \
             --result-format csv > /tmp/team_users.csv
 
-          # 4B & 4C. Reconstruct exact Salesforce Case Lifecycle SLA rows & push all 4 CSVs to Google Sheets
+          # 4B & 4C. Filter Cases server-side by Team User IDs, reconstruct exact Case Lifecycle SLA rows, and push all 4 sheets
           python3 -c '
           import csv, io, json, os, subprocess, urllib.request
           from datetime import datetime
@@ -69,41 +69,22 @@ jobs:
 
           id_list = ",".join(f"\x27{uid}\x27" for uid in team_ids)
 
-          # Step 1: Get CaseIds where Owner history changed this month on Resolved/Canceled cases
-          owner_hist_soql = (
-              "SELECT CaseId, NewValue, OldValue "
-              "FROM CaseHistory "
-              "WHERE Field = \x27Owner\x27 "
-              "AND Case.CreatedDate = THIS_MONTH "
-              "AND Case.Status IN (\x27Canceled\x27, \x27Resolved\x27) "
-              "AND Case.ATG_Current_Queue_Name__c NOT IN (\x27FFT B2B - Reconciliation\x27, \x27FFT ALM - Manual Validation\x27)"
-          )
-          subprocess.run(
-              ["sf", "data", "query", "--query", owner_hist_soql, "--target-org", "my-org", "--result-format", "csv"],
-              stdout=open("/tmp/owner_hist.csv", "w", encoding="utf-8"),
-              check=True
-          )
-
-          team_case_ids = set()
-          with open("/tmp/owner_hist.csv", "r", encoding="utf-8") as f:
-              for r in csv.DictReader(f):
-                  if (r.get("NewValue") or "").strip() in team_names or (r.get("OldValue") or "").strip() in team_names:
-                      team_case_ids.add(r["CaseId"])
-
-          # Also include cases owned directly by team_ids with zero owner transfers
-          direct_cases_soql = (
+          # Step 1: Query ONLY Cases owned by OR modified/created by your 6 Managers\x27 teams on Salesforce\x27s servers
+          team_cases_soql = (
               "SELECT Id FROM Case "
               "WHERE CreatedDate = THIS_MONTH "
               "AND Status IN (\x27Canceled\x27, \x27Resolved\x27) "
               "AND ATG_Current_Queue_Name__c NOT IN (\x27FFT B2B - Reconciliation\x27, \x27FFT ALM - Manual Validation\x27) "
-              f"AND OwnerId IN ({id_list})"
+              f"AND (OwnerId IN ({id_list}) OR LastModifiedById IN ({id_list}) OR CreatedById IN ({id_list}))"
           )
           subprocess.run(
-              ["sf", "data", "query", "--query", direct_cases_soql, "--target-org", "my-org", "--result-format", "csv"],
-              stdout=open("/tmp/direct_cases.csv", "w", encoding="utf-8"),
+              ["sf", "data", "query", "--query", team_cases_soql, "--target-org", "my-org", "--result-format", "csv"],
+              stdout=open("/tmp/team_cases.csv", "w", encoding="utf-8"),
               check=True
           )
-          with open("/tmp/direct_cases.csv", "r", encoding="utf-8") as f:
+
+          team_case_ids = set()
+          with open("/tmp/team_cases.csv", "r", encoding="utf-8") as f:
               for r in csv.DictReader(f):
                   if r.get("Id"):
                       team_case_ids.add(r["Id"].strip())
@@ -225,4 +206,4 @@ jobs:
           post_csv(sla_csv_text, os.environ["WEBHOOK_SLA"], "SLA")
           '
 
-          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/owner_hist.csv /tmp/direct_cases.csv
+          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/team_cases.csv
