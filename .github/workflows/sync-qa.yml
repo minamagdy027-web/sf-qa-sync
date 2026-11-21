@@ -28,7 +28,7 @@ jobs:
           WEBHOOK_SLA: ${{ secrets.GSHEET_WEBHOOK_SLA }}
           WEBHOOK_KEY: ${{ secrets.GSHEET_WEBHOOK_KEY }}
         run: |
-          # Run the 4 independent Salesforce queries IN PARALLEL (~4 seconds total)
+          # 1. Run the 4 independent sf data query CLI commands IN PARALLEL
           sf data query \
             --query "SELECT QMS_Agent_Full_Name__c, Name, QMS_Case_Number__r.CaseNumber, Rating__c, QMS_Total__c FROM QMS_Transaction__c WHERE QMS_Date_Of_Monitoring__c = THIS_MONTH AND QMS_Status__c != 'Draft' AND QMS_Agent_Manager__c IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND QMS_Agent_Full_Name__c NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy') ORDER BY QMS_Agent_Full_Name__c ASC" \
             --target-org my-org \
@@ -49,35 +49,21 @@ jobs:
             --target-org my-org \
             --result-format csv > /tmp/team_users.csv &
 
-          sf org display --target-org my-org --json > /tmp/org_info.json &
-
           wait
 
-          # Query Case & CaseHistory concurrently via Salesforce REST API (10 threads, zero CLI overhead) & push all 4 webhooks in parallel
+          # 2. Run pure sf data query CLI commands in parallel threads & push all 4 sheets concurrently
           python3 -c '
-          import csv, io, json, os, urllib.parse, urllib.request
+          import csv, io, json, os, subprocess, urllib.request
           from concurrent.futures import ThreadPoolExecutor
           from datetime import datetime
           from collections import defaultdict
 
-          with open("/tmp/org_info.json", "r", encoding="utf-8") as f:
-              org_res = json.load(f)["result"]
-          instance_url = org_res["instanceUrl"].rstrip("/")
-          access_token = org_res["accessToken"]
-          api_ver = org_res.get("apiVersion", "62.0")
-
-          def sf_query(soql):
-              records = []
-              url = f"{instance_url}/services/data/v{api_ver}/query?q=" + urllib.parse.quote(soql)
-              headers = {"Authorization": f"Bearer {access_token}"}
-              while url:
-                  req = urllib.request.Request(url, headers=headers)
-                  with urllib.request.urlopen(req) as resp:
-                      data = json.loads(resp.read().decode("utf-8"))
-                  records.extend(data.get("records", []))
-                  next_path = data.get("nextRecordsUrl")
-                  url = f"{instance_url}{next_path}" if next_path else None
-              return records
+          def run_sf_cli(soql):
+              res = subprocess.run(
+                  ["sf", "data", "query", "--query", soql, "--target-org", "my-org", "--result-format", "csv"],
+                  capture_output=True, text=True, check=True
+              )
+              return list(csv.DictReader(io.StringIO(res.stdout)))
 
           team_names = set()
           team_ids = []
@@ -107,14 +93,14 @@ jobs:
               f"AND CreatedById IN ({id_list})"
           )
 
-          # Fetch both CaseId sets concurrently
+          # Fetch both CaseId lists concurrently via sf CLI
           with ThreadPoolExecutor(max_workers=2) as pool:
-              f1 = pool.submit(sf_query, team_cases_soql)
-              f2 = pool.submit(sf_query, hist_touched_soql)
-              team_case_ids = {r["Id"] for r in f1.result() if r.get("Id")}
-              team_case_ids.update(r["CaseId"] for r in f2.result() if r.get("CaseId"))
+              f1 = pool.submit(run_sf_cli, team_cases_soql)
+              f2 = pool.submit(run_sf_cli, hist_touched_soql)
+              team_case_ids = {r["Id"].strip() for r in f1.result() if r.get("Id")}
+              team_case_ids.update(r["CaseId"].strip() for r in f2.result() if r.get("CaseId"))
 
-          # Query full Status + Owner CaseHistory in parallel chunks of 600 CaseIds
+          # Query CaseHistory in parallel chunks of 600 CaseIds via sf CLI (6 concurrent workers)
           all_case_ids = sorted(team_case_ids)
           chunks = [all_case_ids[i:i+600] for i in range(0, len(all_case_ids), 600)]
 
@@ -127,22 +113,20 @@ jobs:
                   f"AND CaseId IN ({in_clause}) "
                   "ORDER BY CaseId ASC, CreatedDate ASC"
               )
-              return sf_query(soql)
+              return run_sf_cli(soql)
 
           cases = defaultdict(list)
           case_meta = {}
-          with ThreadPoolExecutor(max_workers=10) as pool:
+          with ThreadPoolExecutor(max_workers=6) as pool:
               for rows in pool.map(fetch_chunk, chunks):
                   for r in rows:
                       cid = r["CaseId"]
                       cases[cid].append(r)
                       if cid not in case_meta:
-                          c_obj = r.get("Case") or {}
-                          owner_obj = c_obj.get("Owner") or {}
                           case_meta[cid] = (
-                              owner_obj.get("Name") or "",
-                              c_obj.get("Subject") or "",
-                              c_obj.get("CreatedDate") or ""
+                              r.get("Case.Owner.Name", ""),
+                              r.get("Case.Subject", ""),
+                              r.get("Case.CreatedDate", "")
                           )
 
           def parse_ts(ts_str):
@@ -163,7 +147,7 @@ jobs:
               clean_events = []
               for ev in events:
                   if ev["Field"] == "Owner":
-                      val = str(ev.get("NewValue") or ev.get("OldValue") or "")
+                      val = ev["NewValue"] or ev["OldValue"] or ""
                       if val.startswith(("005", "00G")) and len(val) in (15, 18):
                           continue
                   clean_events.append(ev)
@@ -171,7 +155,7 @@ jobs:
               def event_priority(e):
                   if e["Field"] == "Owner":
                       return 0
-                  if e["Field"] == "Status" and (e.get("NewValue") or "") == "In Progress":
+                  if e["Field"] == "Status" and (e["NewValue"] or "") == "In Progress":
                       return 1
                   return 2
 
@@ -179,14 +163,14 @@ jobs:
 
               current_owner = final_owner
               for ev in clean_events:
-                  if ev["Field"] == "Owner" and ev.get("OldValue"):
-                      current_owner = str(ev["OldValue"])
+                  if ev["Field"] == "Owner" and ev["OldValue"]:
+                      current_owner = ev["OldValue"]
                       break
 
               initial_status = "New"
               for ev in clean_events:
-                  if ev["Field"] == "Status" and ev.get("OldValue"):
-                      initial_status = str(ev["OldValue"])
+                  if ev["Field"] == "Status" and ev["OldValue"]:
+                      initial_status = ev["OldValue"]
                       break
 
               current_status = initial_status
@@ -197,7 +181,7 @@ jobs:
               for ev in clean_events:
                   ts = parse_ts(ev["CreatedDate"])
                   fld = ev["Field"]
-                  new_v = str(ev.get("NewValue") or "")
+                  new_v = ev["NewValue"] or ""
 
                   if fld == "Status":
                       if current_status == "In Progress" and in_progress_start is not None:
@@ -250,9 +234,8 @@ jobs:
                   jobs.append((f.read(), os.environ[env_var], label))
           jobs.append((sla_csv_text, os.environ["WEBHOOK_SLA"], "SLA"))
 
-          # Push all 4 Google Sheets concurrently
           with ThreadPoolExecutor(max_workers=4) as pool:
               list(pool.map(post_csv, jobs))
           '
 
-          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/org_info.json
+          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv
