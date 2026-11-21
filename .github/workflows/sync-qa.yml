@@ -1,12 +1,12 @@
-name: Sync Salesforce QA to Google Sheets
+name: Sync Salesforce Reports to Google Sheets
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # Runs automatically every 4 hours
-  workflow_dispatch:       # Adds a manual "Run workflow" button for testing
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
 
 jobs:
-  sync-qa-data:
+  sync-reports:
     runs-on: ubuntu-latest
     steps:
       - name: Install Salesforce CLI
@@ -18,34 +18,47 @@ jobs:
           sf org login sfdx-url --sfdx-url-file authfile.txt --alias my-org
           rm -f authfile.txt
 
-      - name: Query Filtered QA Data & Push Directly to Google Sheets
+      - name: Sync Report 1 (QA) & Report 2 (SF Lateness)
         env:
-          WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          WEBHOOK_QA: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          WEBHOOK_LATENESS: ${{ secrets.GSHEET_WEBHOOK_LATENESS }}
           WEBHOOK_KEY: ${{ secrets.GSHEET_WEBHOOK_KEY }}
         run: |
+          # 1. Export QA Report
           sf data query \
             --query "SELECT QMS_Agent_Full_Name__c, Name, QMS_Case_Number__r.CaseNumber, Rating__c, QMS_Total__c FROM QMS_Transaction__c WHERE QMS_Date_Of_Monitoring__c = THIS_MONTH AND QMS_Status__c != 'Draft' AND QMS_Agent_Manager__c IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND QMS_Agent_Full_Name__c NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy') ORDER BY QMS_Agent_Full_Name__c ASC" \
             --target-org my-org \
             --result-format csv > /tmp/qa_data.csv
 
+          # 2. Export SF Lateness Report
+          sf data query \
+            --query "SELECT User.Name, StatusStartDate FROM UserServicePresence WHERE CreatedDate = THIS_MONTH AND User.Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND User.Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit') ORDER BY User.Name ASC, StatusStartDate ASC" \
+            --target-org my-org \
+            --result-format csv > /tmp/lateness_data.csv
+
+          # 3. Push both CSVs directly to their separate Google Sheets
           python3 -c '
           import json, os, urllib.request
 
-          with open("/tmp/qa_data.csv", "r", encoding="utf-8") as f:
-              csv_text = f.read()
+          jobs = [
+              ("/tmp/qa_data.csv", os.environ["WEBHOOK_QA"]),
+              ("/tmp/lateness_data.csv", os.environ["WEBHOOK_LATENESS"]),
+          ]
 
-          payload = json.dumps({
-              "key": os.environ["WEBHOOK_KEY"],
-              "csv": csv_text
-          }).encode("utf-8")
-
-          req = urllib.request.Request(
-              os.environ["WEBHOOK_URL"],
-              data=payload,
-              headers={"Content-Type": "application/json"}
-          )
-          with urllib.request.urlopen(req) as resp:
-              print(resp.read().decode("utf-8"))
+          for csv_path, webhook_url in jobs:
+              with open(csv_path, "r", encoding="utf-8") as f:
+                  csv_text = f.read()
+              payload = json.dumps({
+                  "key": os.environ["WEBHOOK_KEY"],
+                  "csv": csv_text
+              }).encode("utf-8")
+              req = urllib.request.Request(
+                  webhook_url,
+                  data=payload,
+                  headers={"Content-Type": "application/json"}
+              )
+              with urllib.request.urlopen(req) as resp:
+                  print(csv_path, "->", resp.read().decode("utf-8"))
           '
 
-          rm -f /tmp/qa_data.csv
+          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv
