@@ -9,7 +9,7 @@ jobs:
   sync-all-reports:
     runs-on: ubuntu-latest
     env:
-      SF_ORG_MAX_QUERY_LIMIT: "1000000"
+      SF_ORG_MAX_QUERY_LIMIT: "500000"
     steps:
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
@@ -46,32 +46,46 @@ jobs:
             --target-org my-org \
             --result-format csv > /tmp/breaks_data.csv
 
-          # 4A. Fetch Team Agents under the 6 Managers for Case History Owner filtering
+          # 4A. Fetch Team Agents strictly under your 6 Managers (excluding the 4 agents)
           sf data query \
             --query "SELECT Id, Name FROM User WHERE Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit')" \
             --target-org my-org \
             --result-format csv > /tmp/team_users.csv
 
-          # 4B. Query CaseHistory Lifecycle Events for Cases Opened This Month
-          sf data query \
-            --query "SELECT CaseId, Case.Owner.Name, Case.Subject, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field IN ('created', 'Status', 'Owner') AND Case.CreatedDate = THIS_MONTH AND Case.Status IN ('Canceled', 'Resolved') AND Case.ATG_Current_Queue_Name__c NOT IN ('FFT B2B - Reconciliation', 'FFT ALM - Manual Validation') ORDER BY CaseId ASC, CreatedDate ASC" \
-            --target-org my-org \
-            --result-format csv > /tmp/sla_raw_history.csv
-
-          # Reconstruct exact Case Lifecycle rows & push all 4 CSVs to Google Sheets
+          # 4B & 4C. Filter CaseHistory strictly by your Team User IDs, reconstruct SLA lifecycle rows, and push all 4 sheets
           python3 -c '
-          import csv, io, json, os, urllib.request
+          import csv, io, json, os, subprocess, urllib.request
           from datetime import datetime
           from collections import defaultdict
 
-          # Load team agent names
           team_names = set()
+          team_ids = []
           with open("/tmp/team_users.csv", "r", encoding="utf-8") as f:
               for r in csv.DictReader(f):
                   if r.get("Name"):
                       team_names.add(r["Name"].strip())
+                  if r.get("Id"):
+                      team_ids.append(r["Id"].strip())
 
-          # Group CaseHistory events by CaseId
+          id_list = ",".join(f"\x27{uid}\x27" for uid in team_ids)
+
+          sla_soql = (
+              "SELECT CaseId, Case.Owner.Name, Case.Subject, Field, OldValue, NewValue, CreatedDate "
+              "FROM CaseHistory "
+              "WHERE Field IN (\x27Status\x27, \x27Owner\x27) "
+              "AND Case.CreatedDate = THIS_MONTH "
+              "AND Case.Status IN (\x27Canceled\x27, \x27Resolved\x27) "
+              "AND Case.ATG_Current_Queue_Name__c NOT IN (\x27FFT B2B - Reconciliation\x27, \x27FFT ALM - Manual Validation\x27) "
+              f"AND Case.OwnerId IN ({id_list}) "
+              "ORDER BY CaseId ASC, CreatedDate ASC"
+          )
+
+          subprocess.run(
+              ["sf", "data", "query", "--query", sla_soql, "--target-org", "my-org", "--result-format", "csv"],
+              stdout=open("/tmp/sla_raw_history.csv", "w", encoding="utf-8"),
+              check=True
+          )
+
           cases = defaultdict(list)
           case_meta = {}
           with open("/tmp/sla_raw_history.csv", "r", encoding="utf-8") as f:
@@ -90,7 +104,6 @@ jobs:
 
           for cid, events in cases.items():
               final_owner, subject = case_meta[cid]
-              # Deduplicate Owner ID rows (keep human-readable names, not 15/18-char Salesforce IDs)
               clean_events = []
               for ev in events:
                   if ev["Field"] == "Owner":
@@ -99,7 +112,6 @@ jobs:
                           continue
                   clean_events.append(ev)
 
-              # Determine initial owner before first Owner change
               current_owner = final_owner
               for ev in clean_events:
                   if ev["Field"] == "Owner" and ev["OldValue"]:
@@ -115,12 +127,7 @@ jobs:
                   fld = ev["Field"]
                   new_v = ev["NewValue"] or ""
 
-                  if fld == "created":
-                      if new_v == "In Progress":
-                          current_status = "In Progress"
-                          in_progress_start = ts
-                          seg_owner = current_owner
-                  elif fld == "Status":
+                  if fld == "Status":
                       if current_status == "In Progress" and in_progress_start is not None:
                           dur = round((ts - in_progress_start).total_seconds() / 60.0, 3)
                           if seg_owner in team_names:
