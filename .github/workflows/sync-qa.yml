@@ -18,10 +18,11 @@ jobs:
           sf org login sfdx-url --sfdx-url-file authfile.txt --alias my-org
           rm -f authfile.txt
 
-      - name: Sync Report 1 (QA) & Report 2 (SF Lateness)
+      - name: Sync QA, SF Lateness, and Breaks Reports
         env:
           WEBHOOK_QA: ${{ secrets.GSHEET_WEBHOOK_URL }}
           WEBHOOK_LATENESS: ${{ secrets.GSHEET_WEBHOOK_LATENESS }}
+          WEBHOOK_BREAKS: ${{ secrets.GSHEET_WEBHOOK_BREAKS }}
           WEBHOOK_KEY: ${{ secrets.GSHEET_WEBHOOK_KEY }}
         run: |
           # 1. Export QA Report
@@ -36,13 +37,20 @@ jobs:
             --target-org my-org \
             --result-format csv > /tmp/lateness_data.csv
 
-          # 3. Push both CSVs directly to their separate Google Sheets
+          # 3. Export Breaks Report
+          sf data query \
+            --query "SELECT User.Name, StatusStartDate, StatusEndDate FROM UserServicePresence WHERE CreatedDate = THIS_MONTH AND ServicePresenceStatus.DeveloperName = 'Break' AND User.Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND User.Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit') ORDER BY User.Name ASC, StatusStartDate ASC" \
+            --target-org my-org \
+            --result-format csv > /tmp/breaks_data.csv
+
+          # 4. Push all 3 CSVs directly to their separate Google Sheets
           python3 -c '
           import json, os, urllib.request
 
           jobs = [
               ("/tmp/qa_data.csv", os.environ["WEBHOOK_QA"]),
               ("/tmp/lateness_data.csv", os.environ["WEBHOOK_LATENESS"]),
+              ("/tmp/breaks_data.csv", os.environ["WEBHOOK_BREAKS"]),
           ]
 
           for csv_path, webhook_url in jobs:
@@ -61,4 +69,4 @@ jobs:
                   print(csv_path, "->", resp.read().decode("utf-8"))
           '
 
-          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv
+          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv
