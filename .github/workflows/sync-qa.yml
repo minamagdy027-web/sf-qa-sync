@@ -44,14 +44,15 @@ jobs:
             --target-org my-org \
             --result-format csv > /tmp/breaks_data.csv &
 
+          # Exact 47 Case History Owners from Salesforce Filters 3, 4, 5, and 6
           sf data query \
-            --query "SELECT Id, Name FROM User WHERE Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit')" \
+            --query "SELECT Id, Name FROM User WHERE Name IN ('Mohamed Zakaria Abdelfattah', 'Yehia Sayed yehia Abdelnaby', 'Abdelrahman Atef Abd elhakim Salem', 'Amr Samir Mohamed Khaled Abdelrahman', 'Mahmoud Magdy Gharib', 'Marwa Mohamed Salah Eldein Nassar', 'Mina Magdy Makram Naseem', 'Mohamed Ahmed Abdelhalim Ahmed Farahat', 'Mohamed Alsaeed Taha Abd Elfattah Elkady', 'Mohamed Gamal Bekheit', 'Mohamed Ismail', 'Mohamed Omar Mohamed Afify7', 'Muhammed Essam Eldein Muhammed Hammoudi', 'Nouran Ismail', 'Osama Mohamed Sief Eleslam Abdelaziz', 'Abdel Salam Sayed Abdel Salam', 'Ahmed Ahmed Abotaleb', 'Ahmed Hesham Fouad Radwan', 'Diaa Ali Hamed', 'Eslam khaled elsayed Ahmed', 'Hadeer Alaa El-din', 'Fatma Yehia Zakaria', 'Veronica Ibrahim Guergues', 'Yasmeen Mohamed Elsaid', 'Ahmed Hesham Ahmed Ibrahim Mohamed', 'Basma Anwar Elsayed Mohamed', 'Hossam Mostafa Harby Mostafa', 'Jana Hesham Hammoda Abdelaziz', 'Youssef Shreif Elsayed Ibrahim', 'Aya Abdelaty Morsy', 'Mahmoud Elsayed Abd El-fattah', 'Medhat Ahmed Abdelmoeemen Ahmed', 'Ahmed Ibrahim Selim AIS', 'Aya Abd Elnasser Lotfy', 'Eman Mahfouz Mohamed', 'Mahmoud Nabil Hussein Naguib', 'Mohamed Ahmed Samir', 'Islam Wahed Farouk', 'Belal Ahmed Shaheen', 'Al Sayed Samir Elsayed Elamrosy', 'Ahmed Mostafa Abdelfatah Shalabi', 'Ahmed Ehab Mohamed Badreldin', 'Mina Magdy Rizk Kamel', 'Merna Shaaban Garhy Aboelseoud', 'Mohamed Ayman Mohamed Ishak', 'Mohamed Fathy Ahmed Mohamed Habib', 'Ahmed AboElhamd Kasem Fawy Ashmawy', 'Mostafa Hossam Abdelmonaem Hossam', 'Abdelaziz Abdelhamid Sami', 'Mohamed Reda Abdelsalam Younes', 'Abdelmoniem Mohamed Abdelmoniem Mohamed Elshemy', 'Amr Sameh Mohamed Atef Mohamed Turky', 'Reham Khaled Saad Hamed', 'Shereen Sabry Mohamed Eraqy Mohamed')" \
             --target-org my-org \
             --result-format csv > /tmp/team_users.csv &
 
           wait
 
-          # 2. Run pure sf data query CLI commands in parallel threads & push all 4 sheets concurrently
+          # 2. Pure sf data query CLI parallel execution & webhook sync
           python3 -c '
           import csv, io, json, os, subprocess, urllib.request
           from concurrent.futures import ThreadPoolExecutor
@@ -76,6 +77,7 @@ jobs:
 
           id_list = ",".join(f"\x27{uid}\x27" for uid in team_ids)
 
+          # Match Filter 2 (Status = Canceled/Resolved), Opened Date = THIS_MONTH, Filter 7 (Queue != FFT B2B/ALM)
           team_cases_soql = (
               "SELECT Id FROM Case "
               "WHERE CreatedDate = THIS_MONTH "
@@ -93,14 +95,12 @@ jobs:
               f"AND CreatedById IN ({id_list})"
           )
 
-          # Fetch both CaseId lists concurrently via sf CLI
           with ThreadPoolExecutor(max_workers=2) as pool:
               f1 = pool.submit(run_sf_cli, team_cases_soql)
               f2 = pool.submit(run_sf_cli, hist_touched_soql)
               team_case_ids = {r["Id"].strip() for r in f1.result() if r.get("Id")}
               team_case_ids.update(r["CaseId"].strip() for r in f2.result() if r.get("CaseId"))
 
-          # Query CaseHistory in parallel chunks of 600 CaseIds via sf CLI (6 concurrent workers)
           all_case_ids = sorted(team_case_ids)
           chunks = [all_case_ids[i:i+600] for i in range(0, len(all_case_ids), 600)]
 
@@ -152,6 +152,7 @@ jobs:
                           continue
                   clean_events.append(ev)
 
+              # Exact same-second priority: Owner change -> Status="In Progress" -> Status exit
               def event_priority(e):
                   if e["Field"] == "Owner":
                       return 0
@@ -176,28 +177,24 @@ jobs:
               current_status = initial_status
               in_progress_start = case_created_ts if initial_status == "In Progress" else None
               seg_owner = current_owner
-              had_in_progress = (initial_status == "In Progress")
 
               for ev in clean_events:
                   ts = parse_ts(ev["CreatedDate"])
                   fld = ev["Field"]
                   new_v = ev["NewValue"] or ""
 
+                  # Filter 1: Case History Status equals In Progress (only log In Progress intervals, including 0-minute intervals)
                   if fld == "Status":
                       if current_status == "In Progress" and in_progress_start is not None:
                           dur = fmt_dur((ts - in_progress_start).total_seconds() / 60.0)
                           if seg_owner in team_names:
                               writer.writerow([seg_owner, final_owner, subject, dur])
                           in_progress_start = None
-                      elif new_v in ("Resolved", "Canceled") and not had_in_progress:
-                          if current_owner in team_names:
-                              writer.writerow([current_owner, final_owner, subject, 0])
 
                       current_status = new_v
                       if new_v == "In Progress":
                           in_progress_start = ts
                           seg_owner = current_owner
-                          had_in_progress = True
 
                   elif fld == "Owner":
                       if current_status == "In Progress" and in_progress_start is not None:
