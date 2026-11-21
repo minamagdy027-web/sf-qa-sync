@@ -1,4 +1,4 @@
-name: Sync Salesforce Reports to Google Sheets
+name: Sync All 4 Salesforce Reports to Google Sheets
 
 on:
   schedule:
@@ -6,8 +6,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  sync-reports:
+  sync-all-reports:
     runs-on: ubuntu-latest
+    env:
+      SF_ORG_MAX_QUERY_LIMIT: "1000000"
     steps:
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
@@ -18,44 +20,128 @@ jobs:
           sf org login sfdx-url --sfdx-url-file authfile.txt --alias my-org
           rm -f authfile.txt
 
-      - name: Sync QA, SF Lateness, and Breaks Reports
+      - name: Query Salesforce & Sync All 4 Google Sheets
         env:
           WEBHOOK_QA: ${{ secrets.GSHEET_WEBHOOK_URL }}
           WEBHOOK_LATENESS: ${{ secrets.GSHEET_WEBHOOK_LATENESS }}
           WEBHOOK_BREAKS: ${{ secrets.GSHEET_WEBHOOK_BREAKS }}
+          WEBHOOK_SLA: ${{ secrets.GSHEET_WEBHOOK_SLA }}
           WEBHOOK_KEY: ${{ secrets.GSHEET_WEBHOOK_KEY }}
         run: |
-          # 1. Export QA Report
+          # 1. QA Report
           sf data query \
             --query "SELECT QMS_Agent_Full_Name__c, Name, QMS_Case_Number__r.CaseNumber, Rating__c, QMS_Total__c FROM QMS_Transaction__c WHERE QMS_Date_Of_Monitoring__c = THIS_MONTH AND QMS_Status__c != 'Draft' AND QMS_Agent_Manager__c IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND QMS_Agent_Full_Name__c NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy') ORDER BY QMS_Agent_Full_Name__c ASC" \
             --target-org my-org \
             --result-format csv > /tmp/qa_data.csv
 
-          # 2. Export SF Lateness Report
+          # 2. SF Lateness Report
           sf data query \
             --query "SELECT User.Name, StatusStartDate FROM UserServicePresence WHERE CreatedDate = THIS_MONTH AND User.Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND User.Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit') ORDER BY User.Name ASC, StatusStartDate ASC" \
             --target-org my-org \
             --result-format csv > /tmp/lateness_data.csv
 
-          # 3. Export Breaks Report
+          # 3. Breaks Report
           sf data query \
             --query "SELECT User.Name, StatusStartDate, StatusEndDate FROM UserServicePresence WHERE CreatedDate = THIS_MONTH AND ServicePresenceStatus.DeveloperName = 'Break' AND User.Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND User.Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit') ORDER BY User.Name ASC, StatusStartDate ASC" \
             --target-org my-org \
             --result-format csv > /tmp/breaks_data.csv
 
-          # 4. Push all 3 CSVs directly to their separate Google Sheets
+          # 4A. Fetch Team Agents under the 6 Managers for Case History Owner filtering
+          sf data query \
+            --query "SELECT Id, Name FROM User WHERE Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit')" \
+            --target-org my-org \
+            --result-format csv > /tmp/team_users.csv
+
+          # 4B. Query CaseHistory Lifecycle Events for Cases Opened This Month
+          sf data query \
+            --query "SELECT CaseId, Case.Owner.Name, Case.Subject, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field IN ('created', 'Status', 'Owner') AND Case.CreatedDate = THIS_MONTH AND Case.Status IN ('Canceled', 'Resolved') AND Case.ATG_Current_Queue_Name__c NOT IN ('FFT B2B - Reconciliation', 'FFT ALM - Manual Validation') ORDER BY CaseId ASC, CreatedDate ASC" \
+            --target-org my-org \
+            --result-format csv > /tmp/sla_raw_history.csv
+
+          # Reconstruct exact Case Lifecycle rows & push all 4 CSVs to Google Sheets
           python3 -c '
-          import json, os, urllib.request
+          import csv, io, json, os, urllib.request
+          from datetime import datetime
+          from collections import defaultdict
 
-          jobs = [
-              ("/tmp/qa_data.csv", os.environ["WEBHOOK_QA"]),
-              ("/tmp/lateness_data.csv", os.environ["WEBHOOK_LATENESS"]),
-              ("/tmp/breaks_data.csv", os.environ["WEBHOOK_BREAKS"]),
-          ]
+          # Load team agent names
+          team_names = set()
+          with open("/tmp/team_users.csv", "r", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  if r.get("Name"):
+                      team_names.add(r["Name"].strip())
 
-          for csv_path, webhook_url in jobs:
-              with open(csv_path, "r", encoding="utf-8") as f:
-                  csv_text = f.read()
+          # Group CaseHistory events by CaseId
+          cases = defaultdict(list)
+          case_meta = {}
+          with open("/tmp/sla_raw_history.csv", "r", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  cid = r["CaseId"]
+                  cases[cid].append(r)
+                  if cid not in case_meta:
+                      case_meta[cid] = (r.get("Case.Owner.Name", ""), r.get("Case.Subject", ""))
+
+          def parse_ts(ts_str):
+              return datetime.strptime(ts_str.replace("+0000", "+00:00"), "%Y-%m-%dT%H:%M:%S.%f%z")
+
+          sla_buf = io.StringIO()
+          writer = csv.writer(sla_buf)
+          writer.writerow(["Case History Owner", "Case Owner", "Subject", "Duration"])
+
+          for cid, events in cases.items():
+              final_owner, subject = case_meta[cid]
+              # Deduplicate Owner ID rows (keep human-readable names, not 15/18-char Salesforce IDs)
+              clean_events = []
+              for ev in events:
+                  if ev["Field"] == "Owner":
+                      val = ev["NewValue"] or ev["OldValue"] or ""
+                      if val.startswith(("005", "00G")) and len(val) in (15, 18):
+                          continue
+                  clean_events.append(ev)
+
+              # Determine initial owner before first Owner change
+              current_owner = final_owner
+              for ev in clean_events:
+                  if ev["Field"] == "Owner" and ev["OldValue"]:
+                      current_owner = ev["OldValue"]
+                      break
+
+              current_status = "New"
+              in_progress_start = None
+              seg_owner = current_owner
+
+              for ev in clean_events:
+                  ts = parse_ts(ev["CreatedDate"])
+                  fld = ev["Field"]
+                  new_v = ev["NewValue"] or ""
+
+                  if fld == "created":
+                      if new_v == "In Progress":
+                          current_status = "In Progress"
+                          in_progress_start = ts
+                          seg_owner = current_owner
+                  elif fld == "Status":
+                      if current_status == "In Progress" and in_progress_start is not None:
+                          dur = round((ts - in_progress_start).total_seconds() / 60.0, 3)
+                          if seg_owner in team_names:
+                              writer.writerow([seg_owner, final_owner, subject, dur])
+                          in_progress_start = None
+                      current_status = new_v
+                      if new_v == "In Progress":
+                          in_progress_start = ts
+                          seg_owner = current_owner
+                  elif fld == "Owner":
+                      if current_status == "In Progress" and in_progress_start is not None:
+                          dur = round((ts - in_progress_start).total_seconds() / 60.0, 3)
+                          if seg_owner in team_names:
+                              writer.writerow([seg_owner, final_owner, subject, dur])
+                          in_progress_start = ts
+                      current_owner = new_v
+                      seg_owner = current_owner
+
+          sla_csv_text = sla_buf.getvalue()
+
+          def post_csv(csv_text, webhook_url, label):
               payload = json.dumps({
                   "key": os.environ["WEBHOOK_KEY"],
                   "csv": csv_text
@@ -66,7 +152,17 @@ jobs:
                   headers={"Content-Type": "application/json"}
               )
               with urllib.request.urlopen(req) as resp:
-                  print(csv_path, "->", resp.read().decode("utf-8"))
+                  print(label, "->", resp.read().decode("utf-8"))
+
+          for path, env_var, label in [
+              ("/tmp/qa_data.csv", "WEBHOOK_QA", "QA"),
+              ("/tmp/lateness_data.csv", "WEBHOOK_LATENESS", "Lateness"),
+              ("/tmp/breaks_data.csv", "WEBHOOK_BREAKS", "Breaks"),
+          ]:
+              with open(path, "r", encoding="utf-8") as f:
+                  post_csv(f.read(), os.environ[env_var], label)
+
+          post_csv(sla_csv_text, os.environ["WEBHOOK_SLA"], "SLA")
           '
 
-          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv
+          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/sla_raw_history.csv
