@@ -1,0 +1,51 @@
+name: Sync Salesforce QA to Google Sheets
+
+on:
+  schedule:
+    - cron: '0 */4 * * *' # Runs automatically every 4 hours
+  workflow_dispatch:       # Adds a manual "Run workflow" button for testing
+
+jobs:
+  sync-qa-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Authorize Salesforce Org
+        run: |
+          echo "${{ secrets.SF_AUTH_URL }}" > authfile.txt
+          sf org login sfdx-url --sfdx-url-file authfile.txt --alias my-org
+          rm -f authfile.txt
+
+      - name: Query Filtered QA Data & Push Directly to Google Sheets
+        env:
+          WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          WEBHOOK_KEY: ${{ secrets.GSHEET_WEBHOOK_KEY }}
+        run: |
+          sf data query \
+            --query "SELECT QMS_Agent_Full_Name__c, Name, QMS_Case_Number__r.CaseNumber, Rating__c, QMS_Total__c FROM QMS_Transaction__c WHERE QMS_Date_Of_Monitoring__c = THIS_MONTH AND QMS_Status__c != 'Draft' AND QMS_Agent_Manager__c IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND QMS_Agent_Full_Name__c NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy') ORDER BY QMS_Agent_Full_Name__c ASC" \
+            --target-org my-org \
+            --result-format csv > /tmp/qa_data.csv
+
+          python3 -c '
+          import json, os, urllib.request
+
+          with open("/tmp/qa_data.csv", "r", encoding="utf-8") as f:
+              csv_text = f.read()
+
+          payload = json.dumps({
+              "key": os.environ["WEBHOOK_KEY"],
+              "csv": csv_text
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              os.environ["WEBHOOK_URL"],
+              data=payload,
+              headers={"Content-Type": "application/json"}
+          )
+          with urllib.request.urlopen(req) as resp:
+              print(resp.read().decode("utf-8"))
+          '
+
+          rm -f /tmp/qa_data.csv
