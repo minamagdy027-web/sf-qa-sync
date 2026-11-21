@@ -46,13 +46,13 @@ jobs:
             --target-org my-org \
             --result-format csv > /tmp/breaks_data.csv
 
-          # 4A. Fetch Team Agents strictly under your 6 Managers (excluding the 4 agents)
+          # 4A. Fetch Team Agents under the 6 Managers (excluding the 4 agents)
           sf data query \
             --query "SELECT Id, Name FROM User WHERE Manager.Name IN ('Nada Metwaly', 'Rania Mohamed', 'Abdelrahman Mohamed', 'Nada Metwally', 'Mostafa Hamed', 'Mohamed Sayed') AND Name NOT IN ('Ahmed Basiouny', 'Ahmed Ramadan', 'Hamada Elshenawy', 'Mohamed Bekheit')" \
             --target-org my-org \
             --result-format csv > /tmp/team_users.csv
 
-          # 4B & 4C. Filter Cases server-side by Team User IDs, reconstruct exact Case Lifecycle SLA rows, and push all 4 sheets
+          # 4B & 4C. Capture 100% of team cases (including 0-minute & transferred cases) and push all 4 sheets
           python3 -c '
           import csv, io, json, os, subprocess, urllib.request
           from datetime import datetime
@@ -69,7 +69,7 @@ jobs:
 
           id_list = ",".join(f"\x27{uid}\x27" for uid in team_ids)
 
-          # Step 1: Query ONLY Cases owned by OR modified/created by your 6 Managers\x27 teams on Salesforce\x27s servers
+          # Step 1A: Cases currently owned, created, or last modified by your team
           team_cases_soql = (
               "SELECT Id FROM Case "
               "WHERE CreatedDate = THIS_MONTH "
@@ -88,6 +88,25 @@ jobs:
               for r in csv.DictReader(f):
                   if r.get("Id"):
                       team_case_ids.add(r["Id"].strip())
+
+          # Step 1B: Cases where a team member made ANY Status/Owner history change (even if transferred & closed by another team)
+          hist_touched_soql = (
+              "SELECT CaseId FROM CaseHistory "
+              "WHERE Field IN (\x27Status\x27, \x27Owner\x27) "
+              "AND Case.CreatedDate = THIS_MONTH "
+              "AND Case.Status IN (\x27Canceled\x27, \x27Resolved\x27) "
+              "AND Case.ATG_Current_Queue_Name__c NOT IN (\x27FFT B2B - Reconciliation\x27, \x27FFT ALM - Manual Validation\x27) "
+              f"AND CreatedById IN ({id_list})"
+          )
+          subprocess.run(
+              ["sf", "data", "query", "--query", hist_touched_soql, "--target-org", "my-org", "--result-format", "csv"],
+              stdout=open("/tmp/hist_touched.csv", "w", encoding="utf-8"),
+              check=True
+          )
+          with open("/tmp/hist_touched.csv", "r", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  if r.get("CaseId"):
+                      team_case_ids.add(r["CaseId"].strip())
 
           # Step 2: Query full Status + Owner CaseHistory ONLY for those exact team CaseIds (in chunks of 500 IDs)
           all_case_ids = sorted(team_case_ids)
@@ -136,8 +155,15 @@ jobs:
                           continue
                   clean_events.append(ev)
 
-              # Sort by timestamp, and at identical timestamps process Owner updates before Status changes
-              clean_events.sort(key=lambda e: (e["CreatedDate"], 0 if e["Field"] == "Owner" else 1))
+              # At identical timestamps: Owner change -> Status="In Progress" -> Status="Resolved"/"Canceled"
+              def event_priority(e):
+                  if e["Field"] == "Owner":
+                      return 0
+                  if e["Field"] == "Status" and (e["NewValue"] or "") == "In Progress":
+                      return 1
+                  return 2
+
+              clean_events.sort(key=lambda e: (e["CreatedDate"], event_priority(e)))
 
               # Determine initial owner & initial status at Case creation
               current_owner = final_owner
@@ -206,4 +232,4 @@ jobs:
           post_csv(sla_csv_text, os.environ["WEBHOOK_SLA"], "SLA")
           '
 
-          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/team_cases.csv
+          rm -f /tmp/qa_data.csv /tmp/lateness_data.csv /tmp/breaks_data.csv /tmp/team_users.csv /tmp/team_cases.csv /tmp/hist_touched.csv
